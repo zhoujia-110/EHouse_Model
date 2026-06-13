@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "name": "E-House Project",
+  "dimensions": {
+    "length": 12000.0,
+    "height": 3000.0,
+    "width": 2400.0
+  },
+  "faces": [
+    {
+      "id": "base",
+      "plane_type": "base",
+      "face_model_path": "output\\face_model.json",
+      "center_offset": 0.0
+    }
+  ]
+}
