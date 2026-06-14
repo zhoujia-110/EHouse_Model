@@ -6,8 +6,11 @@ from ehouse_model.base_processing import (
     normalize_base_coordinates,
     prune_base_terminal_stubs,
     snap_extend_centerlines,
+    supplement_centerlines_near_points,
 )
 from ehouse_model.domain import Member2D, Node2D
+from ehouse_model.dxf_reader import DxfSegment2D
+from ehouse_model.face_extractor import FaceExtractionOptions
 from ehouse_model.face_model import CenterlineCandidate, FaceModel
 
 
@@ -211,6 +214,41 @@ def test_snap_extend_centerlines_allows_larger_gap_for_wider_member():
 
     assert snap_count == 1
     assert snapped[0].end == pytest.approx((200, 0))
+
+
+def test_local_patch_adds_shared_edge_centerline_without_global_reselection():
+    segments = [
+        DxfSegment2D(id="S1", start=(0, 0), end=(0, 1000), layer="0", entity_type="LINE"),
+        DxfSegment2D(id="S2", start=(200, 0), end=(200, 1000), layer="0", entity_type="LINE"),
+        DxfSegment2D(id="S3", start=(400, 0), end=(400, 1000), layer="0", entity_type="LINE"),
+    ]
+    existing = [
+        CenterlineCandidate(
+            id="C1",
+            start=(100, 0),
+            end=(100, 1000),
+            source_segment_ids=("S1", "S2"),
+            width=200,
+            overlap=1000,
+        )
+    ]
+
+    supplemented, added_count, warnings = supplement_centerlines_near_points(
+        segments,
+        existing,
+        [(300, 500)],
+        extraction_options=FaceExtractionOptions(max_pair_width=250),
+        radius=300,
+        max_candidates_per_point=1,
+    )
+
+    assert added_count == 1
+    assert warnings[-1].code == "base_local_patch_centerlines_added"
+    assert len(supplemented) == 2
+    assert supplemented[1].kind == "local_cluster_patch"
+    assert supplemented[1].source_segment_ids == ("S2", "S3")
+    assert supplemented[1].start == pytest.approx((300, 0))
+    assert supplemented[1].end == pytest.approx((300, 1000))
 
 
 def test_base_global_model_maps_local_z_to_global_z():

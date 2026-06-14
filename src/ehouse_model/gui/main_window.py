@@ -36,11 +36,13 @@ from PySide6.QtWidgets import (
 )
 
 from ehouse_model.base_processing import (
+    BaseExtractionResult,
     BaseProcessingOptions,
     export_base_staad,
     extract_base_face,
 )
 from ehouse_model.domain import Node2D
+from ehouse_model.dxf_reader import Point2D
 from ehouse_model.face_extractor import FaceExtractionOptions
 from ehouse_model.face_model import FaceModel, write_face_model_json
 
@@ -222,6 +224,10 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("E-House 底座几何提取工具")
         self.resize(1220, 820)
         self.face_model: FaceModel | None = None
+        self.origin_source: Point2D | None = None
+        self.local_patch_points: list[Point2D] = []
+        self.short_member_points: list[Point2D] = []
+        self.cluster_realign_points: list[Point2D] = []
         self._updating_tables = False
 
         root = QWidget()
@@ -255,6 +261,12 @@ class MainWindow(QMainWindow):
         button_row = QHBoxLayout()
         recognize_button = QPushButton(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay), "识别底座")
         recognize_button.clicked.connect(self.recognize_base)
+        local_patch_button = QPushButton(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload), "局部补识别")
+        local_patch_button.clicked.connect(self.local_patch_recognize)
+        short_member_button = QPushButton(self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowRight), "短构件修正")
+        short_member_button.clicked.connect(self.short_member_fix)
+        cluster_realign_button = QPushButton(self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowUp), "邻近错位修正")
+        cluster_realign_button.clicked.connect(self.cluster_realign_fix)
         save_button = QPushButton(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton), "保存修正")
         save_button.clicked.connect(self.save_corrections)
         export_button = QPushButton(self.style().standardIcon(QStyle.StandardPixmap.SP_DriveHDIcon), "导出STD")
@@ -262,6 +274,9 @@ class MainWindow(QMainWindow):
         open_button = QPushButton(self.style().standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon), "打开输出文件夹")
         open_button.clicked.connect(self.open_output_folder)
         button_row.addWidget(recognize_button)
+        button_row.addWidget(local_patch_button)
+        button_row.addWidget(short_member_button)
+        button_row.addWidget(cluster_realign_button)
         button_row.addWidget(save_button)
         button_row.addWidget(export_button)
         button_row.addWidget(open_button)
@@ -329,30 +344,16 @@ class MainWindow(QMainWindow):
 
     def recognize_base(self) -> None:
         try:
-            dxf_path = Path(self.dxf_path_edit.text())
-            std_path = Path(self.std_path_edit.text())
-            output_dir = std_path.parent
-            max_pair_width_m = self.max_pair_width_spin.value()
-            extraction_options = FaceExtractionOptions(
-                max_pair_width=None if max_pair_width_m == 0 else max_pair_width_m * MM_PER_METER
-            )
-            result = extract_base_face(
-                dxf_path,
-                face_model_path=output_dir / "face_model.json",
-                overlay_path=output_dir / "centerline_overlay.dxf",
-                warnings_csv_path=output_dir / "warnings.csv",
-                extraction_options=extraction_options,
-                base_options=BaseProcessingOptions(
-                    snap_extend_tolerance=self.snap_tolerance_spin.value() * MM_PER_METER
-                ),
-            )
-            self.face_model = result.face_model
-            self.preview.set_face_model(self.face_model)
-            self.populate_tables()
+            self.local_patch_points = []
+            self.short_member_points = []
+            self.cluster_realign_points = []
+            result = self._extract_current_base()
+            self._apply_extraction_result(result)
             self.select_origin_node_row()
             self._log(
                 f"识别完成：节点 {len(self.face_model.nodes)} 个，构件 {len(self.face_model.members)} 个，"
                 f"吸附延伸端点 {result.snap_count} 个，"
+                f"同线合并 {result.centerline_cleanup_merged_group_count} 组，"
                 f"裁剪端部构件 {result.terminal_stub_removed_count} 根，"
                 f"原点=({result.origin[0]:.4f}, {result.origin[1]:.4f})m。"
             )
@@ -361,6 +362,110 @@ class MainWindow(QMainWindow):
                     self._log(f"{warning.id} {warning.level} {warning.code}: {warning.message}")
         except Exception as exc:
             self._show_error("识别底座失败", exc)
+
+    def local_patch_recognize(self) -> None:
+        selected = self._selected_node_patch_point("局部补识别")
+        if selected is None:
+            return
+
+        node_id, x_meter, z_meter, patch_point = selected
+        self.local_patch_points.append(patch_point)
+
+        try:
+            result = self._extract_current_base()
+            self._apply_extraction_result(result)
+            self._select_nearest_node(x_meter, z_meter)
+            self._log(
+                f"局部补识别完成：以节点 {node_id} 附近回查DXF线簇，"
+                f"补识别点 {len(self.local_patch_points)} 个，"
+                f"当前新增中心线候选 {result.local_patch_added_count} 根，"
+                f"同线合并 {result.centerline_cleanup_merged_group_count} 组。"
+            )
+            if self.face_model.warnings:
+                for warning in self.face_model.warnings:
+                    if warning.code.startswith("base_local_patch"):
+                        self._log(f"{warning.id} {warning.level} {warning.code}: {warning.message}")
+        except Exception as exc:
+            self.local_patch_points.pop()
+            self._show_error("局部补识别失败", exc)
+
+    def short_member_fix(self) -> None:
+        selected = self._selected_node_patch_point("短构件修正")
+        if selected is None:
+            return
+
+        node_id, x_meter, z_meter, patch_point = selected
+        self.short_member_points.append(patch_point)
+        try:
+            result = self._extract_current_base()
+            self._apply_extraction_result(result)
+            self._select_nearest_node(x_meter, z_meter)
+            self._log(
+                f"短构件修正完成：以节点 {node_id} 附近回查短构件线簇，"
+                f"修正点 {len(self.short_member_points)} 个，"
+                f"新增短构件中心线 {result.short_member_added_count} 根。"
+            )
+            self._log_special_warnings(("short_member_patch",))
+        except Exception as exc:
+            self.short_member_points.pop()
+            self._show_error("短构件修正失败", exc)
+
+    def cluster_realign_fix(self) -> None:
+        selected = self._selected_node_patch_point("邻近错位修正")
+        if selected is None:
+            return
+
+        node_id, x_meter, z_meter, patch_point = selected
+        self.cluster_realign_points.append(patch_point)
+        try:
+            result = self._extract_current_base()
+            self._apply_extraction_result(result)
+            self._select_nearest_node(x_meter, z_meter)
+            self._log(
+                f"邻近错位修正完成：以节点 {node_id} 附近重选局部线簇，"
+                f"修正点 {len(self.cluster_realign_points)} 个，"
+                f"替换线簇 {result.cluster_realign_replaced_group_count} 组，"
+                f"删除 {result.cluster_realign_removed_count} 根，"
+                f"新增 {result.cluster_realign_added_count} 根。"
+            )
+            self._log_special_warnings(("cluster_realign",))
+        except Exception as exc:
+            self.cluster_realign_points.pop()
+            self._show_error("邻近错位修正失败", exc)
+
+    def _extract_current_base(
+        self,
+    ) -> BaseExtractionResult:
+        dxf_path = Path(self.dxf_path_edit.text())
+        output_dir = Path(self.std_path_edit.text()).parent
+        return extract_base_face(
+            dxf_path,
+            face_model_path=output_dir / "face_model.json",
+            overlay_path=output_dir / "centerline_overlay.dxf",
+            warnings_csv_path=output_dir / "warnings.csv",
+            extraction_options=self._current_extraction_options(),
+            base_options=self._current_base_options(),
+            local_patch_points=tuple(self.local_patch_points),
+            short_member_points=tuple(self.short_member_points),
+            cluster_realign_points=tuple(self.cluster_realign_points),
+        )
+
+    def _current_extraction_options(self) -> FaceExtractionOptions:
+        max_pair_width_m = self.max_pair_width_spin.value()
+        return FaceExtractionOptions(
+            max_pair_width=None if max_pair_width_m == 0 else max_pair_width_m * MM_PER_METER
+        )
+
+    def _current_base_options(self) -> BaseProcessingOptions:
+        return BaseProcessingOptions(
+            snap_extend_tolerance=self.snap_tolerance_spin.value() * MM_PER_METER
+        )
+
+    def _apply_extraction_result(self, result: BaseExtractionResult) -> None:
+        self.face_model = result.face_model
+        self.origin_source = result.origin_source
+        self.preview.set_face_model(self.face_model)
+        self.populate_tables()
 
     def save_corrections(self) -> None:
         if self.face_model is None:
@@ -513,6 +618,59 @@ class MainWindow(QMainWindow):
                 self.node_table.setCurrentCell(row, 0)
                 self.preview.set_highlighted_node(node_item.text())
                 return
+
+    def _selected_node_for_local_patch(self) -> tuple[str, float, float] | None:
+        row = self.node_table.currentRow()
+        if row < 0:
+            return None
+        node_item = self.node_table.item(row, 0)
+        x_item = self.node_table.item(row, 1)
+        z_item = self.node_table.item(row, 2)
+        if node_item is None or x_item is None or z_item is None:
+            return None
+
+        try:
+            return (node_item.text(), float(x_item.text()), float(z_item.text()))
+        except ValueError:
+            QMessageBox.warning(self, "坐标格式错误", "当前节点坐标必须是数字。")
+            return None
+
+    def _selected_node_patch_point(self, action_name: str) -> tuple[str, float, float, Point2D] | None:
+        if self.face_model is None:
+            QMessageBox.information(self, f"没有可{action_name}内容", "请先识别底座DXF。")
+            return None
+        if self.origin_source is None:
+            QMessageBox.information(self, "缺少原点信息", "请重新识别底座DXF后再做修正。")
+            return None
+
+        selected = self._selected_node_for_local_patch()
+        if selected is None:
+            QMessageBox.information(self, "未选择节点", "请先在预览图或节点表中选择一个问题节点。")
+            return None
+
+        node_id, x_meter, z_meter = selected
+        patch_point = (
+            self.origin_source[0] + x_meter * MM_PER_METER,
+            self.origin_source[1] - z_meter * MM_PER_METER,
+        )
+        return node_id, x_meter, z_meter, patch_point
+
+    def _log_special_warnings(self, prefixes: tuple[str, ...]) -> None:
+        if self.face_model is None:
+            return
+        for warning in self.face_model.warnings:
+            if warning.code.startswith(prefixes):
+                self._log(f"{warning.id} {warning.level} {warning.code}: {warning.message}")
+
+    def _select_nearest_node(self, x_meter: float, z_meter: float) -> None:
+        if self.face_model is None or not self.face_model.nodes:
+            return
+        node = min(
+            self.face_model.nodes,
+            key=lambda item: (item.x - x_meter) * (item.x - x_meter)
+            + (item.y - z_meter) * (item.y - z_meter),
+        )
+        self.select_node_by_id(node.id)
 
     def _log(self, message: str) -> None:
         self.log.appendPlainText(message)

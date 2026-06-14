@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
+from ehouse_model.centerline_cleanup import (
+    CenterlineCleanupOptions,
+    cleanup_centerline_candidates,
+    realign_centerline_cluster_near_points,
+    supplement_short_member_centerlines,
+)
 from ehouse_model.domain import Member2D, Member3D, Node2D, Node3D
-from ehouse_model.dxf_reader import Point2D, read_dxf_segments, write_overlay_dxf
+from ehouse_model.dxf_reader import DxfSegment2D, Point2D, read_dxf_segments, write_overlay_dxf
 from ehouse_model.exporters import export_staad_geometry, export_warnings_csv
 from ehouse_model.face_extractor import FaceExtractionOptions, extract_centerline_candidates
 from ehouse_model.face_model import (
@@ -22,6 +28,10 @@ from ehouse_model.global_model_types import GlobalModel
 DXF_MM_TO_M = 0.001
 DEFAULT_SNAP_EXTENSION_MARGIN = 5.0
 DEFAULT_SNAP_EXTENSION_MARGIN_RATIO = 0.05
+DEFAULT_LOCAL_PATCH_RADIUS = 1000.0
+DEFAULT_LOCAL_PATCH_WIDTH_TOLERANCE = 10.0
+DEFAULT_LOCAL_PATCH_WIDTH_TOLERANCE_RATIO = 0.05
+DEFAULT_LOCAL_PATCH_MAX_CANDIDATES_PER_POINT = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +40,11 @@ class BaseProcessingOptions:
     node_merge_tolerance: float = 1e-6
     snap_extension_margin: float = DEFAULT_SNAP_EXTENSION_MARGIN
     snap_extension_margin_ratio: float = DEFAULT_SNAP_EXTENSION_MARGIN_RATIO
+    local_patch_radius: float = DEFAULT_LOCAL_PATCH_RADIUS
+    local_patch_width_tolerance: float = DEFAULT_LOCAL_PATCH_WIDTH_TOLERANCE
+    local_patch_width_tolerance_ratio: float = DEFAULT_LOCAL_PATCH_WIDTH_TOLERANCE_RATIO
+    local_patch_max_candidates_per_point: int = DEFAULT_LOCAL_PATCH_MAX_CANDIDATES_PER_POINT
+    centerline_cleanup_options: CenterlineCleanupOptions = field(default_factory=CenterlineCleanupOptions)
 
     def __post_init__(self) -> None:
         if self.snap_extend_tolerance < 0:
@@ -40,12 +55,21 @@ class BaseProcessingOptions:
             raise ValueError("snap_extension_margin cannot be negative")
         if self.snap_extension_margin_ratio < 0:
             raise ValueError("snap_extension_margin_ratio cannot be negative")
+        if self.local_patch_radius <= 0:
+            raise ValueError("local_patch_radius must be positive")
+        if self.local_patch_width_tolerance < 0:
+            raise ValueError("local_patch_width_tolerance cannot be negative")
+        if self.local_patch_width_tolerance_ratio < 0:
+            raise ValueError("local_patch_width_tolerance_ratio cannot be negative")
+        if self.local_patch_max_candidates_per_point <= 0:
+            raise ValueError("local_patch_max_candidates_per_point must be positive")
 
 
 @dataclass(frozen=True, slots=True)
 class BaseNormalizationResult:
     face_model: FaceModel
     origin: Point2D
+    origin_source: Point2D
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,7 +78,15 @@ class BaseExtractionResult:
     global_model: GlobalModel
     origin: Point2D
     snap_count: int
+    origin_source: Point2D = (0.0, 0.0)
     terminal_stub_removed_count: int = 0
+    local_patch_added_count: int = 0
+    short_member_added_count: int = 0
+    cluster_realign_added_count: int = 0
+    cluster_realign_removed_count: int = 0
+    cluster_realign_replaced_group_count: int = 0
+    centerline_cleanup_merged_group_count: int = 0
+    centerline_cleanup_removed_candidate_count: int = 0
 
 
 def extract_base_face(
@@ -65,6 +97,9 @@ def extract_base_face(
     warnings_csv_path: str | Path | None = None,
     extraction_options: FaceExtractionOptions | None = None,
     base_options: BaseProcessingOptions | None = None,
+    local_patch_points: tuple[Point2D, ...] | list[Point2D] | None = None,
+    short_member_points: tuple[Point2D, ...] | list[Point2D] | None = None,
+    cluster_realign_points: tuple[Point2D, ...] | list[Point2D] | None = None,
 ) -> BaseExtractionResult:
     """Extract, snap/extend, normalize, and optionally save a base face model."""
     extract_opts = extraction_options or FaceExtractionOptions()
@@ -73,6 +108,52 @@ def extract_base_face(
 
     segments = read_dxf_segments(source_path)
     candidates, extraction_warnings = extract_centerline_candidates(segments, extract_opts)
+    local_patch_added_count = 0
+    local_patch_warnings: tuple[WarningRecord, ...] = ()
+    short_member_added_count = 0
+    short_member_warnings: tuple[WarningRecord, ...] = ()
+    cluster_realign_added_count = 0
+    cluster_realign_removed_count = 0
+    cluster_realign_replaced_group_count = 0
+    cluster_realign_warnings: tuple[WarningRecord, ...] = ()
+    if local_patch_points:
+        candidates, local_patch_added_count, local_patch_warnings = supplement_centerlines_near_points(
+            segments,
+            candidates,
+            local_patch_points,
+            extraction_options=extract_opts,
+            radius=base_opts.local_patch_radius,
+            width_tolerance=base_opts.local_patch_width_tolerance,
+            width_tolerance_ratio=base_opts.local_patch_width_tolerance_ratio,
+            max_candidates_per_point=base_opts.local_patch_max_candidates_per_point,
+        )
+    if short_member_points:
+        short_member_result = supplement_short_member_centerlines(
+            segments,
+            candidates,
+            short_member_points,
+            base_opts.centerline_cleanup_options,
+        )
+        candidates = list(short_member_result.centerlines)
+        short_member_added_count = short_member_result.added_count
+        short_member_warnings = short_member_result.warnings
+    if cluster_realign_points:
+        cluster_realign_result = realign_centerline_cluster_near_points(
+            segments,
+            candidates,
+            cluster_realign_points,
+            base_opts.centerline_cleanup_options,
+        )
+        candidates = list(cluster_realign_result.centerlines)
+        cluster_realign_added_count = cluster_realign_result.added_count
+        cluster_realign_removed_count = cluster_realign_result.removed_count
+        cluster_realign_replaced_group_count = cluster_realign_result.replaced_group_count
+        cluster_realign_warnings = cluster_realign_result.warnings
+    cleanup_result = cleanup_centerline_candidates(
+        candidates,
+        base_opts.centerline_cleanup_options,
+    )
+    candidates = list(cleanup_result.centerlines)
     snapped_candidates, snap_count, snap_warnings = snap_extend_centerlines(
         candidates,
         tolerance=base_opts.snap_extend_tolerance,
@@ -91,7 +172,15 @@ def extract_base_face(
         raw_model,
         tolerance=base_opts.node_merge_tolerance,
     )
-    warning_inputs = [*extraction_warnings, *snap_warnings, *topology.warnings]
+    warning_inputs = [
+        *extraction_warnings,
+        *local_patch_warnings,
+        *short_member_warnings,
+        *cluster_realign_warnings,
+        *cleanup_result.warnings,
+        *snap_warnings,
+        *topology.warnings,
+    ]
     if terminal_stub_removed_count:
         warning_inputs.append(
             WarningRecord(
@@ -125,8 +214,355 @@ def extract_base_face(
         global_model=global_model,
         origin=normalized.origin,
         snap_count=snap_count,
+        origin_source=normalized.origin_source,
         terminal_stub_removed_count=terminal_stub_removed_count,
+        local_patch_added_count=local_patch_added_count,
+        short_member_added_count=short_member_added_count,
+        cluster_realign_added_count=cluster_realign_added_count,
+        cluster_realign_removed_count=cluster_realign_removed_count,
+        cluster_realign_replaced_group_count=cluster_realign_replaced_group_count,
+        centerline_cleanup_merged_group_count=cleanup_result.merged_group_count,
+        centerline_cleanup_removed_candidate_count=cleanup_result.removed_candidate_count,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class _LocalProjectedSegment:
+    index: int
+    segment: DxfSegment2D
+    direction: Point2D
+    normal: Point2D
+    length: float
+    interval: tuple[float, float]
+    offset: float
+
+
+@dataclass(frozen=True, slots=True)
+class _LocalPairCandidate:
+    left: _LocalProjectedSegment
+    right: _LocalProjectedSegment
+    start_t: float
+    end_t: float
+    width: float
+    overlap: float
+    score: float
+
+
+def supplement_centerlines_near_points(
+    segments: tuple[DxfSegment2D, ...] | list[DxfSegment2D],
+    centerlines: tuple[CenterlineCandidate, ...] | list[CenterlineCandidate],
+    patch_points: tuple[Point2D, ...] | list[Point2D],
+    *,
+    extraction_options: FaceExtractionOptions | None = None,
+    radius: float = DEFAULT_LOCAL_PATCH_RADIUS,
+    width_tolerance: float = DEFAULT_LOCAL_PATCH_WIDTH_TOLERANCE,
+    width_tolerance_ratio: float = DEFAULT_LOCAL_PATCH_WIDTH_TOLERANCE_RATIO,
+    max_candidates_per_point: int = DEFAULT_LOCAL_PATCH_MAX_CANDIDATES_PER_POINT,
+) -> tuple[tuple[CenterlineCandidate, ...], int, tuple[WarningRecord, ...]]:
+    """Add conservative local centerline candidates around user-picked DXF points.
+
+    This is intended for rare shared-edge/closely-packed members. It does not
+    change the global pair selection; it only looks near explicit patch points.
+    """
+    if radius <= 0:
+        raise ValueError("radius must be positive")
+    if width_tolerance < 0:
+        raise ValueError("width_tolerance cannot be negative")
+    if width_tolerance_ratio < 0:
+        raise ValueError("width_tolerance_ratio cannot be negative")
+    if max_candidates_per_point <= 0:
+        raise ValueError("max_candidates_per_point must be positive")
+
+    opts = extraction_options or FaceExtractionOptions()
+    existing = list(centerlines)
+    points = tuple(patch_points)
+    warnings: list[WarningRecord] = []
+    if not points:
+        return tuple(existing), 0, ()
+
+    known_widths = _known_centerline_widths(existing, opts.min_pair_width)
+    if not known_widths:
+        warnings.append(
+            WarningRecord(
+                level="info",
+                code="base_local_patch_no_reference_width",
+                message="Local patch skipped because no existing member widths were available.",
+            )
+        )
+        return tuple(existing), 0, tuple(warnings)
+
+    projected = [
+        projection
+        for index, segment in enumerate(segments)
+        if (projection := _project_local_segment(index, segment, opts)) is not None
+    ]
+    if not projected:
+        return tuple(existing), 0, ()
+
+    added_count = 0
+    max_known_width = max(known_widths)
+    min_dot = math.cos(math.radians(opts.angle_tolerance_degrees))
+
+    for point_index, patch_point in enumerate(points, start=1):
+        nearby = [
+            segment
+            for segment in projected
+            if _distance_point_to_segment(
+                patch_point,
+                segment.segment.start,
+                segment.segment.end,
+            )
+            <= radius + max_known_width
+        ]
+        pair_candidates = _find_local_pair_candidates(
+            nearby,
+            patch_point=patch_point,
+            known_widths=known_widths,
+            options=opts,
+            radius=radius,
+            width_tolerance=width_tolerance,
+            width_tolerance_ratio=width_tolerance_ratio,
+            min_dot=min_dot,
+        )
+
+        added_for_point = 0
+        for pair in pair_candidates:
+            if added_for_point >= max_candidates_per_point:
+                break
+
+            candidate = _local_centerline_from_pair(f"C{len(existing) + 1}", pair)
+            if any(
+                _is_duplicate_centerline(existing_candidate, candidate, opts.duplicate_centerline_tolerance)
+                for existing_candidate in existing
+            ):
+                continue
+
+            existing.append(candidate)
+            added_for_point += 1
+            added_count += 1
+
+        if added_for_point == 0:
+            warnings.append(
+                WarningRecord(
+                    level="info",
+                    code="base_local_patch_no_candidate",
+                    message=(
+                        f"No local centerline candidate was added near patch point "
+                        f"{point_index} at ({patch_point[0]:.3f}, {patch_point[1]:.3f})."
+                    ),
+                )
+            )
+
+    if added_count:
+        warnings.append(
+            WarningRecord(
+                level="info",
+                code="base_local_patch_centerlines_added",
+                message=f"{added_count} local centerline candidate(s) were added near user-picked nodes.",
+            )
+        )
+
+    return tuple(existing), added_count, tuple(warnings)
+
+
+def _find_local_pair_candidates(
+    projected: list[_LocalProjectedSegment],
+    *,
+    patch_point: Point2D,
+    known_widths: tuple[float, ...],
+    options: FaceExtractionOptions,
+    radius: float,
+    width_tolerance: float,
+    width_tolerance_ratio: float,
+    min_dot: float,
+) -> list[_LocalPairCandidate]:
+    pair_candidates: list[_LocalPairCandidate] = []
+
+    for left_index, left in enumerate(projected):
+        for right in projected[left_index + 1 :]:
+            if _dot(left.direction, right.direction) < min_dot:
+                continue
+
+            right_interval = _segment_interval_on_direction(right.segment, left.direction)
+            start_t = max(left.interval[0], right_interval[0])
+            end_t = min(left.interval[1], right_interval[1])
+            overlap = end_t - start_t
+            if overlap <= options.min_segment_length:
+                continue
+
+            min_length = min(left.length, right.length)
+            overlap_ratio = overlap / min_length
+            if overlap_ratio < options.min_overlap_ratio:
+                continue
+
+            right_offset = _segment_offset_on_normal(right.segment, left.normal)
+            width = abs(left.offset - right_offset)
+            if width < options.min_pair_width:
+                continue
+            if not _width_matches_known(width, known_widths, width_tolerance, width_tolerance_ratio):
+                continue
+
+            max_width = options.max_pair_width
+            if max_width is None:
+                max_width = min_length * options.max_pair_width_to_length_ratio
+            if width > max_width:
+                continue
+
+            pair = _LocalPairCandidate(
+                left=left,
+                right=right,
+                start_t=start_t,
+                end_t=end_t,
+                width=width,
+                overlap=overlap,
+                score=0.0,
+            )
+            preview = _local_centerline_from_pair("preview", pair)
+            distance_to_patch = _distance_point_to_segment(
+                patch_point,
+                preview.start,
+                preview.end,
+            )
+            if distance_to_patch > radius:
+                continue
+
+            width_error = min(abs(width - known_width) for known_width in known_widths)
+            score = (distance_to_patch / radius) + (width_error / max(width, 1.0)) + (1.0 - overlap_ratio)
+            pair_candidates.append(
+                _LocalPairCandidate(
+                    left=left,
+                    right=right,
+                    start_t=start_t,
+                    end_t=end_t,
+                    width=width,
+                    overlap=overlap,
+                    score=score,
+                )
+            )
+
+    return sorted(
+        pair_candidates,
+        key=lambda pair: (pair.score, pair.width, pair.left.index, pair.right.index),
+    )
+
+
+def _project_local_segment(
+    index: int,
+    segment: DxfSegment2D,
+    options: FaceExtractionOptions,
+) -> _LocalProjectedSegment | None:
+    vector = _subtract(segment.end, segment.start)
+    length = math.hypot(vector[0], vector[1])
+    if length < options.min_segment_length:
+        return None
+
+    direction = (vector[0] / length, vector[1] / length)
+    if direction[0] < -1e-12 or (abs(direction[0]) <= 1e-12 and direction[1] < 0):
+        direction = (-direction[0], -direction[1])
+
+    normal = (-direction[1], direction[0])
+    return _LocalProjectedSegment(
+        index=index,
+        segment=segment,
+        direction=direction,
+        normal=normal,
+        length=length,
+        interval=_segment_interval_on_direction(segment, direction),
+        offset=_segment_offset_on_normal(segment, normal),
+    )
+
+
+def _local_centerline_from_pair(candidate_id: str, pair: _LocalPairCandidate) -> CenterlineCandidate:
+    right_offset = _segment_offset_on_normal(pair.right.segment, pair.left.normal)
+    center_offset = (pair.left.offset + right_offset) / 2.0
+    start = _point_from_projection(pair.left.direction, pair.left.normal, pair.start_t, center_offset)
+    end = _point_from_projection(pair.left.direction, pair.left.normal, pair.end_t, center_offset)
+    return CenterlineCandidate(
+        id=candidate_id,
+        kind="local_cluster_patch",
+        start=start,
+        end=end,
+        source_segment_ids=(pair.left.segment.id, pair.right.segment.id),
+        width=pair.width,
+        overlap=pair.overlap,
+        confidence=0.75,
+    )
+
+
+def _known_centerline_widths(
+    centerlines: list[CenterlineCandidate],
+    min_width: float,
+) -> tuple[float, ...]:
+    widths: dict[float, int] = {}
+    for candidate in centerlines:
+        if candidate.width < min_width:
+            continue
+        rounded_width = round(candidate.width, 3)
+        widths[rounded_width] = widths.get(rounded_width, 0) + 1
+
+    return tuple(sorted(widths))
+
+
+def _width_matches_known(
+    width: float,
+    known_widths: tuple[float, ...],
+    absolute_tolerance: float,
+    ratio_tolerance: float,
+) -> bool:
+    return any(
+        abs(width - known_width) <= max(absolute_tolerance, known_width * ratio_tolerance)
+        for known_width in known_widths
+    )
+
+
+def _segment_interval_on_direction(segment: DxfSegment2D, direction: Point2D) -> tuple[float, float]:
+    start_t = _dot(segment.start, direction)
+    end_t = _dot(segment.end, direction)
+    return (min(start_t, end_t), max(start_t, end_t))
+
+
+def _segment_offset_on_normal(segment: DxfSegment2D, normal: Point2D) -> float:
+    start_offset = _dot(segment.start, normal)
+    end_offset = _dot(segment.end, normal)
+    return (start_offset + end_offset) / 2.0
+
+
+def _point_from_projection(direction: Point2D, normal: Point2D, t_value: float, offset: float) -> Point2D:
+    return (
+        direction[0] * t_value + normal[0] * offset,
+        direction[1] * t_value + normal[1] * offset,
+    )
+
+
+def _is_duplicate_centerline(
+    existing: CenterlineCandidate,
+    candidate: CenterlineCandidate,
+    tolerance: float,
+) -> bool:
+    if tolerance <= 0:
+        return False
+
+    existing_vector = _subtract(existing.end, existing.start)
+    candidate_vector = _subtract(candidate.end, candidate.start)
+    existing_length = math.hypot(existing_vector[0], existing_vector[1])
+    candidate_length = math.hypot(candidate_vector[0], candidate_vector[1])
+    if existing_length <= tolerance or candidate_length <= tolerance:
+        return False
+
+    existing_direction = (existing_vector[0] / existing_length, existing_vector[1] / existing_length)
+    candidate_direction = (candidate_vector[0] / candidate_length, candidate_vector[1] / candidate_length)
+    if abs(_cross(existing_direction, candidate_direction)) > 1e-6:
+        return False
+
+    if _distance_point_to_infinite_line(candidate.start, existing.start, existing.end) > tolerance:
+        return False
+    if _distance_point_to_infinite_line(candidate.end, existing.start, existing.end) > tolerance:
+        return False
+
+    existing_interval = _point_interval_on_direction(existing.start, existing.end, existing_direction)
+    candidate_interval = _point_interval_on_direction(candidate.start, candidate.end, existing_direction)
+    overlap = min(existing_interval[1], candidate_interval[1]) - max(existing_interval[0], candidate_interval[0])
+    return overlap >= min(existing_length, candidate_length) - tolerance
 
 
 def snap_extend_centerlines(
@@ -256,7 +692,7 @@ def normalize_base_coordinates(face_model: FaceModel) -> BaseNormalizationResult
         member_sources=face_model.member_sources,
         warnings=face_model.warnings,
     )
-    return BaseNormalizationResult(face_model=model, origin=origin_m)
+    return BaseNormalizationResult(face_model=model, origin=origin_m, origin_source=origin_mm)
 
 
 def prune_base_terminal_stubs(
@@ -442,6 +878,24 @@ def _distance_point_to_segment(point: Point2D, start: Point2D, end: Point2D) -> 
     clamped_t = min(max(t_value, 0.0), 1.0)
     closest = _point_at(start, end, clamped_t)
     return _distance(point, closest)
+
+
+def _distance_point_to_infinite_line(point: Point2D, line_start: Point2D, line_end: Point2D) -> float:
+    line = _subtract(line_end, line_start)
+    length = math.hypot(line[0], line[1])
+    if length <= 1e-12:
+        return _distance(point, line_start)
+    return abs(_cross(_subtract(point, line_start), line)) / length
+
+
+def _point_interval_on_direction(
+    start: Point2D,
+    end: Point2D,
+    direction: Point2D,
+) -> tuple[float, float]:
+    start_t = _dot(start, direction)
+    end_t = _dot(end, direction)
+    return (min(start_t, end_t), max(start_t, end_t))
 
 
 def _normalize_point(point: Point2D, origin: Point2D) -> Point2D:
