@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, replace
 import os
 from pathlib import Path
 import sys
@@ -12,6 +13,7 @@ from PySide6.QtGui import QColor, QBrush, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QGraphicsItem,
@@ -23,11 +25,13 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QDialog,
     QMainWindow,
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
     QSplitter,
+    QSpinBox,
     QStyle,
     QTableWidget,
     QTableWidgetItem,
@@ -39,15 +43,38 @@ from ehouse_model.base_processing import (
     BaseExtractionResult,
     BaseProcessingOptions,
     export_base_staad,
-    extract_base_face,
 )
-from ehouse_model.domain import Node2D
+from ehouse_model.correction_tools import (
+    CORRECTION_CLUSTER_REALIGN,
+    CORRECTION_LOCAL_PATCH,
+    CORRECTION_SHORT_MEMBER,
+    CorrectionStep,
+    extract_base_with_correction_steps,
+)
+from ehouse_model.domain import Member2D, Node2D
 from ehouse_model.dxf_reader import Point2D
 from ehouse_model.face_extractor import FaceExtractionOptions
 from ehouse_model.face_model import FaceModel, write_face_model_json
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 MM_PER_METER = 1000.0
+
+
+@dataclass(frozen=True, slots=True)
+class _ModelSnapshot:
+    face_model: FaceModel | None
+    outline_segments: tuple[tuple[Point2D, Point2D], ...]
+    origin_source: Point2D | None
+    correction_steps: tuple[CorrectionStep, ...]
+    selected_node_id: str | None
+    selected_member_id: str | None
+    label: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ModelDelta:
+    node_ids: tuple[str, ...]
+    member_ids: tuple[str, ...]
 
 
 class CenterlinePreview(QGraphicsView):
@@ -62,15 +89,37 @@ class CenterlinePreview(QGraphicsView):
         self.setBackgroundBrush(QBrush(QColor("#ffffff")))
         self.setMinimumSize(560, 360)
         self._model: FaceModel | None = None
+        self._outline_segments: tuple[tuple[Point2D, Point2D], ...] = ()
         self._highlighted_node_id: str | None = None
         self._highlighted_member_id: str | None = None
         self._view_bounds = QRectF(0, 0, 1, 1)
         self._pick_radius_pixels = 10.0
         self._member_pick_radius_pixels = 8.0
+        self._auto_fit = True
+        self._zoom_level = 0
+        self._is_panning = False
+        self._last_pan_position = None
+        self._space_pressed = False
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
-    def set_face_model(self, model: FaceModel | None) -> None:
+    def set_face_model(self, model: FaceModel | None, *, reset_view: bool = False) -> None:
         self._model = model
+        if reset_view:
+            self._auto_fit = True
+            self._zoom_level = 0
         self._redraw()
+
+    def set_outline_segments(self, segments: tuple[tuple[Point2D, Point2D], ...]) -> None:
+        self._outline_segments = segments
+        self._redraw()
+
+    def fit_to_view(self) -> None:
+        if self._view_bounds.isValid() and not self._view_bounds.isNull():
+            self._auto_fit = True
+            self._zoom_level = 0
+            self.fitInView(self._view_bounds, Qt.AspectRatioMode.KeepAspectRatio)
 
     def set_highlighted_node(self, node_id: str | None) -> None:
         self._highlighted_node_id = node_id
@@ -92,6 +141,9 @@ class CenterlinePreview(QGraphicsView):
             return
 
         nodes = {node.id: node for node in model.nodes}
+        outline_pen = QPen(QColor("#cbd5e1"))
+        outline_pen.setWidthF(0)
+        outline_pen.setCosmetic(True)
         line_pen = QPen(QColor("#4b5563"))
         line_pen.setWidthF(0)
         line_pen.setCosmetic(True)
@@ -99,6 +151,9 @@ class CenterlinePreview(QGraphicsView):
         node_pen.setWidthF(0)
         node_pen.setCosmetic(True)
         node_brush = QBrush(QColor("#111827"))
+
+        for start, end in self._outline_segments:
+            self.scene.addLine(start[0], start[1], end[0], end[1], outline_pen)
 
         for member in model.members:
             start = nodes.get(member.start_node_id)
@@ -143,18 +198,57 @@ class CenterlinePreview(QGraphicsView):
             label.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
             label.setPos(highlighted.x, highlighted.y)
 
-        bounds = _model_bounds(model)
+        bounds = _model_bounds(model, self._outline_segments)
         margin = max(max(bounds.width(), bounds.height()) * 0.05, 0.5)
         self._view_bounds = bounds.adjusted(-margin, -margin, margin, margin)
         self.scene.setSceneRect(self._view_bounds)
-        self.fitInView(self._view_bounds, Qt.AspectRatioMode.KeepAspectRatio)
+        if self._auto_fit:
+            self.fitInView(self._view_bounds, Qt.AspectRatioMode.KeepAspectRatio)
 
     def resizeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         super().resizeEvent(event)
-        if self._view_bounds.isValid() and not self._view_bounds.isNull():
+        if self._auto_fit and self._view_bounds.isValid() and not self._view_bounds.isNull():
             self.fitInView(self._view_bounds, Qt.AspectRatioMode.KeepAspectRatio)
 
+    def wheelEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if self._model is None:
+            super().wheelEvent(event)
+            return
+
+        delta = event.angleDelta().y()
+        if delta == 0:
+            event.accept()
+            return
+
+        next_zoom = self._zoom_level + (1 if delta > 0 else -1)
+        if not -8 <= next_zoom <= 28:
+            event.accept()
+            return
+
+        factor = 1.18 if delta > 0 else 1 / 1.18
+        self._auto_fit = False
+        self._zoom_level = next_zoom
+        self.scale(factor, factor)
+        event.accept()
+
+    def mouseDoubleClickEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.fit_to_view()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
     def mousePressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        self.setFocus()
+        if event.button() == Qt.MouseButton.MiddleButton or (
+            event.button() == Qt.MouseButton.LeftButton and self._space_pressed
+        ):
+            self._is_panning = True
+            self._last_pan_position = event.position()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+
         if event.button() == Qt.MouseButton.LeftButton:
             node_id = self._nearest_node_id(event.position())
             if node_id is not None:
@@ -169,6 +263,46 @@ class CenterlinePreview(QGraphicsView):
                 event.accept()
                 return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if self._is_panning and self._last_pan_position is not None:
+            delta = event.position() - self._last_pan_position
+            self._last_pan_position = event.position()
+            self._auto_fit = False
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - int(delta.x()))
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - int(delta.y()))
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if self._is_panning and event.button() in (
+            Qt.MouseButton.MiddleButton,
+            Qt.MouseButton.LeftButton,
+        ):
+            self._is_panning = False
+            self._last_pan_position = None
+            self.setCursor(Qt.CursorShape.OpenHandCursor if self._space_pressed else Qt.CursorShape.ArrowCursor)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
+            self._space_pressed = True
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
+            self._space_pressed = False
+            if not self._is_panning:
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+            event.accept()
+            return
+        super().keyReleaseEvent(event)
 
     def _nearest_node_id(self, view_position) -> str | None:  # type: ignore[no-untyped-def]
         model = self._model
@@ -218,16 +352,173 @@ class CenterlinePreview(QGraphicsView):
         return best_member_id
 
 
+class LargePreviewDialog(QDialog):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("中心线放大查看")
+        self.resize(1180, 760)
+
+        layout = QVBoxLayout(self)
+        button_row = QHBoxLayout()
+        fit_button = QPushButton("适配窗口")
+        fit_button.clicked.connect(self.fit_to_view)
+        button_row.addWidget(fit_button)
+        button_row.addStretch()
+        layout.addLayout(button_row)
+
+        self.preview = CenterlinePreview()
+        self.preview.setMinimumSize(980, 620)
+        layout.addWidget(self.preview, 1)
+
+    def set_preview_data(
+        self,
+        model: FaceModel | None,
+        outline_segments: tuple[tuple[Point2D, Point2D], ...],
+    ) -> None:
+        self.preview.set_outline_segments(outline_segments)
+        self.preview.set_face_model(model, reset_view=True)
+
+    def set_highlighted_node(self, node_id: str | None) -> None:
+        self.preview.set_highlighted_node(node_id)
+
+    def set_highlighted_member(self, member_id: str | None) -> None:
+        self.preview.set_highlighted_member(member_id)
+
+    def fit_to_view(self) -> None:
+        self.preview.fit_to_view()
+
+
+class CorrectionToolDialog(QDialog):
+    preview_requested = Signal()
+
+    def __init__(
+        self,
+        tool_kind: str,
+        title: str,
+        extraction_options: FaceExtractionOptions,
+        base_options: BaseProcessingOptions,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.tool_kind = tool_kind
+        self.extraction_options = extraction_options
+        self.base_options = base_options
+        self.preview_result: BaseExtractionResult | None = None
+        self.preview_step: CorrectionStep | None = None
+        self.setWindowTitle(title)
+        self.setMinimumWidth(420)
+
+        layout = QVBoxLayout(self)
+        form = QGridLayout()
+        layout.addLayout(form)
+
+        row = 0
+        if tool_kind == CORRECTION_LOCAL_PATCH:
+            self.local_radius_spin = _distance_spin(base_options.local_patch_radius / MM_PER_METER)
+            self.local_width_tolerance_spin = _distance_spin(base_options.local_patch_width_tolerance / MM_PER_METER)
+            self.local_width_ratio_spin = _ratio_spin(base_options.local_patch_width_tolerance_ratio, 0.0, 1.0, 0.01)
+            self.local_max_candidates_spin = _integer_spin(1, 20, base_options.local_patch_max_candidates_per_point)
+            row = _add_spin_row(form, row, "搜索半径(m)", self.local_radius_spin)
+            row = _add_spin_row(form, row, "宽度容差(m)", self.local_width_tolerance_spin)
+            row = _add_spin_row(form, row, "宽度容差比例", self.local_width_ratio_spin)
+            row = _add_spin_row(form, row, "每点最多新增", self.local_max_candidates_spin)
+        elif tool_kind == CORRECTION_SHORT_MEMBER:
+            cleanup = base_options.centerline_cleanup_options
+            self.short_radius_spin = _distance_spin(cleanup.short_member_radius / MM_PER_METER)
+            self.short_max_length_spin = _distance_spin(cleanup.short_member_max_length / MM_PER_METER)
+            self.short_width_ratio_spin = _ratio_spin(cleanup.short_member_max_width_to_length_ratio, 0.05, 10.0, 0.1)
+            self.short_overlap_ratio_spin = _ratio_spin(cleanup.min_overlap_ratio, 0.05, 1.0, 0.05)
+            self.short_max_candidates_spin = _integer_spin(1, 20, cleanup.short_member_max_candidates_per_point)
+            row = _add_spin_row(form, row, "搜索半径(m)", self.short_radius_spin)
+            row = _add_spin_row(form, row, "最大长度(m)", self.short_max_length_spin)
+            row = _add_spin_row(form, row, "宽长比上限", self.short_width_ratio_spin)
+            row = _add_spin_row(form, row, "最小重叠比例", self.short_overlap_ratio_spin)
+            row = _add_spin_row(form, row, "每点最多新增", self.short_max_candidates_spin)
+        elif tool_kind == CORRECTION_CLUSTER_REALIGN:
+            cleanup = base_options.centerline_cleanup_options
+            self.cluster_radius_spin = _distance_spin(cleanup.cluster_realign_radius / MM_PER_METER)
+            self.cluster_search_spin = _integer_spin(1, 80, cleanup.cluster_realign_max_search_candidates)
+            self.cluster_angle_spin = _angle_spin(cleanup.angle_tolerance_degrees)
+            self.cluster_orientation_combo = QComboBox()
+            self.cluster_orientation_combo.addItem("自动", "auto")
+            self.cluster_orientation_combo.addItem("水平", "horizontal")
+            self.cluster_orientation_combo.addItem("竖向", "vertical")
+            row = _add_spin_row(form, row, "搜索半径(m)", self.cluster_radius_spin)
+            row = _add_spin_row(form, row, "最多搜索候选", self.cluster_search_spin)
+            row = _add_spin_row(form, row, "角度容差(度)", self.cluster_angle_spin)
+            form.addWidget(QLabel("重选方向"), row, 0)
+            form.addWidget(self.cluster_orientation_combo, row, 1)
+        else:
+            raise ValueError(f"unknown correction tool: {tool_kind}")
+
+        button_row = QHBoxLayout()
+        self.preview_button = QPushButton("生成预览")
+        self.preview_button.clicked.connect(self.preview_requested.emit)
+        self.apply_button = QPushButton("应用")
+        self.apply_button.setEnabled(False)
+        self.apply_button.clicked.connect(self.accept)
+        cancel_button = QPushButton("取消")
+        cancel_button.clicked.connect(self.reject)
+        button_row.addWidget(self.preview_button)
+        button_row.addStretch()
+        button_row.addWidget(self.apply_button)
+        button_row.addWidget(cancel_button)
+        layout.addLayout(button_row)
+
+    def build_step(self, point: Point2D) -> CorrectionStep:
+        base_options = self.base_options
+        cleanup = base_options.centerline_cleanup_options
+        extraction_options = self.extraction_options
+
+        if self.tool_kind == CORRECTION_LOCAL_PATCH:
+            base_options = replace(
+                base_options,
+                local_patch_radius=self.local_radius_spin.value() * MM_PER_METER,
+                local_patch_width_tolerance=self.local_width_tolerance_spin.value() * MM_PER_METER,
+                local_patch_width_tolerance_ratio=self.local_width_ratio_spin.value(),
+                local_patch_max_candidates_per_point=self.local_max_candidates_spin.value(),
+            )
+        elif self.tool_kind == CORRECTION_SHORT_MEMBER:
+            cleanup = replace(
+                cleanup,
+                min_overlap_ratio=self.short_overlap_ratio_spin.value(),
+                short_member_radius=self.short_radius_spin.value() * MM_PER_METER,
+                short_member_max_length=self.short_max_length_spin.value() * MM_PER_METER,
+                short_member_max_width_to_length_ratio=self.short_width_ratio_spin.value(),
+                short_member_max_candidates_per_point=self.short_max_candidates_spin.value(),
+            )
+            base_options = replace(base_options, centerline_cleanup_options=cleanup)
+        elif self.tool_kind == CORRECTION_CLUSTER_REALIGN:
+            cleanup = replace(
+                cleanup,
+                angle_tolerance_degrees=self.cluster_angle_spin.value(),
+                cluster_realign_radius=self.cluster_radius_spin.value() * MM_PER_METER,
+                cluster_realign_max_search_candidates=self.cluster_search_spin.value(),
+                cluster_realign_orientation=str(self.cluster_orientation_combo.currentData()),
+            )
+            base_options = replace(base_options, centerline_cleanup_options=cleanup)
+
+        return CorrectionStep(
+            kind=self.tool_kind,
+            point=point,
+            extraction_options=extraction_options,
+            base_options=base_options,
+        )
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("E-House 底座几何提取工具")
         self.resize(1220, 820)
         self.face_model: FaceModel | None = None
+        self.outline_segments: tuple[tuple[Point2D, Point2D], ...] = ()
+        self.large_preview_dialog: LargePreviewDialog | None = None
         self.origin_source: Point2D | None = None
-        self.local_patch_points: list[Point2D] = []
-        self.short_member_points: list[Point2D] = []
-        self.cluster_realign_points: list[Point2D] = []
+        self.correction_steps: list[CorrectionStep] = []
+        self.undo_stack: list[_ModelSnapshot] = []
+        self.initial_extraction_options = FaceExtractionOptions()
+        self.initial_base_options = BaseProcessingOptions()
         self._updating_tables = False
 
         root = QWidget()
@@ -247,6 +538,7 @@ class MainWindow(QMainWindow):
         self.std_path_edit = QLineEdit(str(PROJECT_ROOT / "output" / "base" / "geometry.std"))
         self.max_pair_width_spin = _optional_distance_spin()
         self.max_pair_width_spin.setSpecialValueText("自动")
+        self.pair_width_ratio_spin = _ratio_spin(0.35, 0.1, 2.0, 0.05)
         self.snap_tolerance_spin = _distance_spin(0.2)
 
         grid.addWidget(QLabel("底座DXF"), 0, 0)
@@ -257,6 +549,8 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.max_pair_width_spin, 2, 1)
         grid.addWidget(QLabel("最大延伸上限(m)"), 2, 2)
         grid.addWidget(self.snap_tolerance_spin, 2, 3)
+        grid.addWidget(QLabel("宽长比上限"), 3, 0)
+        grid.addWidget(self.pair_width_ratio_spin, 3, 1)
 
         button_row = QHBoxLayout()
         recognize_button = QPushButton(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay), "识别底座")
@@ -267,6 +561,8 @@ class MainWindow(QMainWindow):
         short_member_button.clicked.connect(self.short_member_fix)
         cluster_realign_button = QPushButton(self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowUp), "邻近错位修正")
         cluster_realign_button.clicked.connect(self.cluster_realign_fix)
+        undo_button = QPushButton("撤销上一步")
+        undo_button.clicked.connect(self.undo_last_action)
         save_button = QPushButton(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton), "保存修正")
         save_button.clicked.connect(self.save_corrections)
         export_button = QPushButton(self.style().standardIcon(QStyle.StandardPixmap.SP_DriveHDIcon), "导出STD")
@@ -277,11 +573,12 @@ class MainWindow(QMainWindow):
         button_row.addWidget(local_patch_button)
         button_row.addWidget(short_member_button)
         button_row.addWidget(cluster_realign_button)
+        button_row.addWidget(undo_button)
         button_row.addWidget(save_button)
         button_row.addWidget(export_button)
         button_row.addWidget(open_button)
         button_row.addStretch()
-        grid.addLayout(button_row, 3, 0, 1, 4)
+        grid.addLayout(button_row, 4, 0, 1, 4)
 
         main_layout.addWidget(box)
 
@@ -290,6 +587,15 @@ class MainWindow(QMainWindow):
 
         preview_box = QGroupBox("中心线预览")
         preview_layout = QVBoxLayout(preview_box)
+        preview_tools = QHBoxLayout()
+        fit_preview_button = QPushButton("适配窗口")
+        fit_preview_button.clicked.connect(self.fit_preview_to_view)
+        large_preview_button = QPushButton("放大查看")
+        large_preview_button.clicked.connect(self.open_large_preview)
+        preview_tools.addWidget(fit_preview_button)
+        preview_tools.addWidget(large_preview_button)
+        preview_tools.addStretch()
+        preview_layout.addLayout(preview_tools)
         self.preview = CenterlinePreview()
         self.preview.node_clicked.connect(self.select_node_by_id)
         self.preview.member_clicked.connect(self.select_member_by_id)
@@ -344,11 +650,12 @@ class MainWindow(QMainWindow):
 
     def recognize_base(self) -> None:
         try:
-            self.local_patch_points = []
-            self.short_member_points = []
-            self.cluster_realign_points = []
+            self.correction_steps = []
+            self.undo_stack = []
+            self.initial_extraction_options = self._current_extraction_options()
+            self.initial_base_options = self._current_base_options()
             result = self._extract_current_base()
-            self._apply_extraction_result(result)
+            self._apply_extraction_result(result, reset_view=True)
             self.select_origin_node_row()
             self._log(
                 f"识别完成：节点 {len(self.face_model.nodes)} 个，构件 {len(self.face_model.members)} 个，"
@@ -364,108 +671,222 @@ class MainWindow(QMainWindow):
             self._show_error("识别底座失败", exc)
 
     def local_patch_recognize(self) -> None:
-        selected = self._selected_node_patch_point("局部补识别")
-        if selected is None:
-            return
-
-        node_id, x_meter, z_meter, patch_point = selected
-        self.local_patch_points.append(patch_point)
-
-        try:
-            result = self._extract_current_base()
-            self._apply_extraction_result(result)
-            self._select_nearest_node(x_meter, z_meter)
-            self._log(
-                f"局部补识别完成：以节点 {node_id} 附近回查DXF线簇，"
-                f"补识别点 {len(self.local_patch_points)} 个，"
-                f"当前新增中心线候选 {result.local_patch_added_count} 根，"
-                f"同线合并 {result.centerline_cleanup_merged_group_count} 组。"
-            )
-            if self.face_model.warnings:
-                for warning in self.face_model.warnings:
-                    if warning.code.startswith("base_local_patch"):
-                        self._log(f"{warning.id} {warning.level} {warning.code}: {warning.message}")
-        except Exception as exc:
-            self.local_patch_points.pop()
-            self._show_error("局部补识别失败", exc)
+        self._run_correction_tool(CORRECTION_LOCAL_PATCH, "局部补识别")
 
     def short_member_fix(self) -> None:
-        selected = self._selected_node_patch_point("短构件修正")
-        if selected is None:
-            return
-
-        node_id, x_meter, z_meter, patch_point = selected
-        self.short_member_points.append(patch_point)
-        try:
-            result = self._extract_current_base()
-            self._apply_extraction_result(result)
-            self._select_nearest_node(x_meter, z_meter)
-            self._log(
-                f"短构件修正完成：以节点 {node_id} 附近回查短构件线簇，"
-                f"修正点 {len(self.short_member_points)} 个，"
-                f"新增短构件中心线 {result.short_member_added_count} 根。"
-            )
-            self._log_special_warnings(("short_member_patch",))
-        except Exception as exc:
-            self.short_member_points.pop()
-            self._show_error("短构件修正失败", exc)
+        self._run_correction_tool(CORRECTION_SHORT_MEMBER, "短构件修正")
 
     def cluster_realign_fix(self) -> None:
-        selected = self._selected_node_patch_point("邻近错位修正")
+        self._run_correction_tool(CORRECTION_CLUSTER_REALIGN, "邻近错位修正")
+
+    def _run_correction_tool(self, tool_kind: str, title: str) -> None:
+        selected = self._selected_node_patch_point(title)
         if selected is None:
             return
 
         node_id, x_meter, z_meter, patch_point = selected
-        self.cluster_realign_points.append(patch_point)
+        dialog = CorrectionToolDialog(
+            tool_kind,
+            title,
+            self.initial_extraction_options,
+            self.initial_base_options,
+            self,
+        )
+
+        def generate_preview() -> None:
+            try:
+                step = dialog.build_step(patch_point)
+                result = self._extract_with_correction_steps(
+                    tuple([*self.correction_steps, step]),
+                    write_outputs=False,
+                )
+                dialog.preview_step = step
+                dialog.preview_result = result
+                dialog.apply_button.setEnabled(True)
+                self._show_correction_preview(result)
+                self._log(self._correction_preview_summary(title, result, _model_delta(self.face_model, result.face_model)))
+            except Exception as exc:
+                dialog.apply_button.setEnabled(False)
+                self._restore_current_preview()
+                self._show_error(f"{title}预览失败", exc)
+
+        dialog.preview_requested.connect(generate_preview)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self._restore_current_preview()
+            return
+
+        if dialog.preview_step is None or dialog.preview_result is None:
+            self._restore_current_preview()
+            QMessageBox.information(self, "尚未生成预览", "请先生成预览，确认结果后再应用。")
+            return
+
         try:
-            result = self._extract_current_base()
-            self._apply_extraction_result(result)
-            self._select_nearest_node(x_meter, z_meter)
-            self._log(
-                f"邻近错位修正完成：以节点 {node_id} 附近重选局部线簇，"
-                f"修正点 {len(self.cluster_realign_points)} 个，"
-                f"替换线簇 {result.cluster_realign_replaced_group_count} 组，"
-                f"删除 {result.cluster_realign_removed_count} 根，"
-                f"新增 {result.cluster_realign_added_count} 根。"
-            )
-            self._log_special_warnings(("cluster_realign",))
+            before_model = self.face_model
+            self._push_history(title)
+            self.correction_steps.append(dialog.preview_step)
+            result = self._extract_with_correction_steps(tuple(self.correction_steps), write_outputs=True)
+            delta = _model_delta(before_model, result.face_model)
+            self._apply_extraction_result(result, reset_view=False)
+            self._jump_to_delta(delta, fallback_point=(x_meter, z_meter))
+            self._log(self._correction_apply_summary(title, node_id, result, delta))
         except Exception as exc:
-            self.cluster_realign_points.pop()
-            self._show_error("邻近错位修正失败", exc)
+            self.undo_last_action(silent=True)
+            self._show_error(f"{title}应用失败", exc)
+
+    def _correction_preview_summary(
+        self,
+        title: str,
+        result: BaseExtractionResult,
+        delta: _ModelDelta,
+    ) -> str:
+        return (
+            f"{title}预览：节点 {len(result.face_model.nodes)} 个，构件 {len(result.face_model.members)} 个，"
+            f"局部新增 {result.local_patch_added_count}，短构件新增 {result.short_member_added_count}，"
+            f"邻近替换 {result.cluster_realign_replaced_group_count} 组；"
+            f"新增节点 {_format_id_list(delta.node_ids)}，新增构件 {_format_id_list(delta.member_ids)}。"
+        )
+
+    def _correction_apply_summary(
+        self,
+        title: str,
+        node_id: str,
+        result: BaseExtractionResult,
+        delta: _ModelDelta,
+    ) -> str:
+        return (
+            f"{title}已应用：以节点 {node_id} 附近修正，"
+            f"局部新增 {result.local_patch_added_count}，短构件新增 {result.short_member_added_count}，"
+            f"邻近替换 {result.cluster_realign_replaced_group_count} 组，"
+            f"当前节点 {len(result.face_model.nodes)} 个，构件 {len(result.face_model.members)} 个；"
+            f"新增节点 {_format_id_list(delta.node_ids)}，新增构件 {_format_id_list(delta.member_ids)}。"
+        )
+
+    def _jump_to_delta(self, delta: _ModelDelta, *, fallback_point: tuple[float, float]) -> None:
+        if delta.node_ids:
+            self.select_node_by_id(delta.node_ids[0])
+        if delta.member_ids:
+            self.select_member_by_id(delta.member_ids[0])
+        if not delta.node_ids and not delta.member_ids:
+            self._select_nearest_node(*fallback_point)
+
+    def _push_history(self, label: str) -> None:
+        self.undo_stack.append(
+            _ModelSnapshot(
+                face_model=self.face_model,
+                outline_segments=self.outline_segments,
+                origin_source=self.origin_source,
+                correction_steps=tuple(self.correction_steps),
+                selected_node_id=self._current_selected_node_id(),
+                selected_member_id=self._current_selected_member_id(),
+                label=label,
+            )
+        )
+
+    def undo_last_action(self, checked: bool = False, *, silent: bool = False) -> None:
+        if not self.undo_stack:
+            if not silent:
+                QMessageBox.information(self, "没有可撤销步骤", "当前没有可撤销的修正或坐标编辑。")
+            return
+
+        snapshot = self.undo_stack.pop()
+        self.correction_steps = list(snapshot.correction_steps)
+        self._set_model_state(
+            snapshot.face_model,
+            snapshot.outline_segments,
+            snapshot.origin_source,
+            reset_view=False,
+        )
+        if snapshot.selected_node_id:
+            self.select_node_by_id(snapshot.selected_node_id)
+        elif snapshot.selected_member_id:
+            self.select_member_by_id(snapshot.selected_member_id)
+        if not silent:
+            self._log(f"已撤销：{snapshot.label}")
+
+    def _current_selected_node_id(self) -> str | None:
+        row = self.node_table.currentRow()
+        if row < 0:
+            return None
+        item = self.node_table.item(row, 0)
+        return item.text() if item is not None else None
+
+    def _current_selected_member_id(self) -> str | None:
+        row = self.member_table.currentRow()
+        if row < 0:
+            return None
+        item = self.member_table.item(row, 0)
+        return item.text() if item is not None else None
 
     def _extract_current_base(
         self,
     ) -> BaseExtractionResult:
+        return self._extract_with_correction_steps(tuple(self.correction_steps), write_outputs=True)
+
+    def _extract_with_correction_steps(
+        self,
+        correction_steps: tuple[CorrectionStep, ...],
+        *,
+        write_outputs: bool,
+    ) -> BaseExtractionResult:
         dxf_path = Path(self.dxf_path_edit.text())
         output_dir = Path(self.std_path_edit.text()).parent
-        return extract_base_face(
+        return extract_base_with_correction_steps(
             dxf_path,
-            face_model_path=output_dir / "face_model.json",
-            overlay_path=output_dir / "centerline_overlay.dxf",
-            warnings_csv_path=output_dir / "warnings.csv",
-            extraction_options=self._current_extraction_options(),
-            base_options=self._current_base_options(),
-            local_patch_points=tuple(self.local_patch_points),
-            short_member_points=tuple(self.short_member_points),
-            cluster_realign_points=tuple(self.cluster_realign_points),
+            face_model_path=output_dir / "face_model.json" if write_outputs else None,
+            overlay_path=output_dir / "centerline_overlay.dxf" if write_outputs else None,
+            warnings_csv_path=output_dir / "warnings.csv" if write_outputs else None,
+            extraction_options=self.initial_extraction_options,
+            base_options=self.initial_base_options,
+            correction_steps=correction_steps,
         )
 
     def _current_extraction_options(self) -> FaceExtractionOptions:
         max_pair_width_m = self.max_pair_width_spin.value()
         return FaceExtractionOptions(
-            max_pair_width=None if max_pair_width_m == 0 else max_pair_width_m * MM_PER_METER
+            max_pair_width=None if max_pair_width_m == 0 else max_pair_width_m * MM_PER_METER,
+            max_pair_width_to_length_ratio=self.pair_width_ratio_spin.value(),
         )
 
     def _current_base_options(self) -> BaseProcessingOptions:
         return BaseProcessingOptions(
-            snap_extend_tolerance=self.snap_tolerance_spin.value() * MM_PER_METER
+            snap_extend_tolerance=self.snap_tolerance_spin.value() * MM_PER_METER,
         )
 
-    def _apply_extraction_result(self, result: BaseExtractionResult) -> None:
-        self.face_model = result.face_model
-        self.origin_source = result.origin_source
-        self.preview.set_face_model(self.face_model)
+    def _apply_extraction_result(self, result: BaseExtractionResult, *, reset_view: bool) -> None:
+        self._set_model_state(
+            result.face_model,
+            result.outline_segments,
+            result.origin_source,
+            reset_view=reset_view,
+        )
+
+    def _set_model_state(
+        self,
+        face_model: FaceModel | None,
+        outline_segments: tuple[tuple[Point2D, Point2D], ...],
+        origin_source: Point2D | None,
+        *,
+        reset_view: bool,
+    ) -> None:
+        self.face_model = face_model
+        self.outline_segments = outline_segments
+        self.origin_source = origin_source
+        self.preview.set_outline_segments(self.outline_segments)
+        self.preview.set_face_model(self.face_model, reset_view=reset_view)
+        self._refresh_large_preview(reset_view=reset_view)
         self.populate_tables()
+
+    def _show_correction_preview(self, result: BaseExtractionResult) -> None:
+        self.preview.set_outline_segments(result.outline_segments)
+        self.preview.set_face_model(result.face_model, reset_view=False)
+        if self.large_preview_dialog is not None and self.large_preview_dialog.isVisible():
+            self.large_preview_dialog.preview.set_outline_segments(result.outline_segments)
+            self.large_preview_dialog.preview.set_face_model(result.face_model, reset_view=False)
+
+    def _restore_current_preview(self) -> None:
+        self.preview.set_outline_segments(self.outline_segments)
+        self.preview.set_face_model(self.face_model, reset_view=False)
+        self._refresh_large_preview(reset_view=False)
 
     def save_corrections(self) -> None:
         if self.face_model is None:
@@ -496,6 +917,8 @@ class MainWindow(QMainWindow):
 
     def populate_tables(self) -> None:
         if self.face_model is None:
+            self.node_table.setRowCount(0)
+            self.member_table.setRowCount(0)
             return
 
         self._updating_tables = True
@@ -531,6 +954,18 @@ class MainWindow(QMainWindow):
             self.populate_tables()
             return
 
+        old_node = next((node for node in self.face_model.nodes if node.id == node_id), None)
+        if old_node is not None:
+            old_value = old_node.x if item.column() == 1 else old_node.y
+            if abs(old_value - value) <= 1e-9:
+                self._updating_tables = True
+                try:
+                    item.setText(_format4(value))
+                finally:
+                    self._updating_tables = False
+                return
+        self._push_history("节点坐标编辑")
+
         nodes: list[Node2D] = []
         for node in self.face_model.nodes:
             if node.id == node_id:
@@ -555,6 +990,7 @@ class MainWindow(QMainWindow):
         finally:
             self._updating_tables = False
         self.preview.set_face_model(self.face_model)
+        self._refresh_large_preview(reset_view=False)
 
     def node_table_current_item_changed(
         self,
@@ -564,7 +1000,9 @@ class MainWindow(QMainWindow):
         if self._updating_tables or self.face_model is None or current is None:
             return
         node_item = self.node_table.item(current.row(), 0)
-        self.preview.set_highlighted_node(node_item.text() if node_item else None)
+        node_id = node_item.text() if node_item else None
+        self.preview.set_highlighted_node(node_id)
+        self._set_large_highlighted_node(node_id)
 
     def member_table_current_item_changed(
         self,
@@ -574,7 +1012,9 @@ class MainWindow(QMainWindow):
         if self._updating_tables or self.face_model is None or current is None:
             return
         member_item = self.member_table.item(current.row(), 0)
-        self.preview.set_highlighted_member(member_item.text() if member_item else None)
+        member_id = member_item.text() if member_item else None
+        self.preview.set_highlighted_member(member_id)
+        self._set_large_highlighted_member(member_id)
 
     def select_node_by_id(self, node_id: str) -> None:
         for row in range(self.node_table.rowCount()):
@@ -588,6 +1028,7 @@ class MainWindow(QMainWindow):
                 QAbstractItemView.ScrollHint.PositionAtCenter,
             )
             self.preview.set_highlighted_node(node_id)
+            self._set_large_highlighted_node(node_id)
             return
 
     def select_member_by_id(self, member_id: str) -> None:
@@ -602,6 +1043,7 @@ class MainWindow(QMainWindow):
                 QAbstractItemView.ScrollHint.PositionAtCenter,
             )
             self.preview.set_highlighted_member(member_id)
+            self._set_large_highlighted_member(member_id)
             return
 
     def select_origin_node_row(self) -> None:
@@ -617,6 +1059,7 @@ class MainWindow(QMainWindow):
                 self.node_table.selectRow(row)
                 self.node_table.setCurrentCell(row, 0)
                 self.preview.set_highlighted_node(node_item.text())
+                self._set_large_highlighted_node(node_item.text())
                 return
 
     def _selected_node_for_local_patch(self) -> tuple[str, float, float] | None:
@@ -672,6 +1115,38 @@ class MainWindow(QMainWindow):
         )
         self.select_node_by_id(node.id)
 
+    def fit_preview_to_view(self) -> None:
+        self.preview.fit_to_view()
+
+    def open_large_preview(self) -> None:
+        if self.face_model is None:
+            QMessageBox.information(self, "没有可查看内容", "请先识别底座DXF。")
+            return
+
+        if self.large_preview_dialog is None:
+            self.large_preview_dialog = LargePreviewDialog(self)
+            self.large_preview_dialog.preview.node_clicked.connect(self.select_node_by_id)
+            self.large_preview_dialog.preview.member_clicked.connect(self.select_member_by_id)
+
+        self.large_preview_dialog.set_preview_data(self.face_model, self.outline_segments)
+        self.large_preview_dialog.show()
+        self.large_preview_dialog.raise_()
+        self.large_preview_dialog.activateWindow()
+
+    def _refresh_large_preview(self, *, reset_view: bool) -> None:
+        if self.large_preview_dialog is None or not self.large_preview_dialog.isVisible():
+            return
+        self.large_preview_dialog.preview.set_outline_segments(self.outline_segments)
+        self.large_preview_dialog.preview.set_face_model(self.face_model, reset_view=reset_view)
+
+    def _set_large_highlighted_node(self, node_id: str | None) -> None:
+        if self.large_preview_dialog is not None and self.large_preview_dialog.isVisible():
+            self.large_preview_dialog.set_highlighted_node(node_id)
+
+    def _set_large_highlighted_member(self, member_id: str | None) -> None:
+        if self.large_preview_dialog is not None and self.large_preview_dialog.isVisible():
+            self.large_preview_dialog.set_highlighted_member(member_id)
+
     def _log(self, message: str) -> None:
         self.log.appendPlainText(message)
 
@@ -707,6 +1182,43 @@ def _distance_spin(value: float) -> QDoubleSpinBox:
     return spin
 
 
+def _ratio_spin(
+    value: float,
+    minimum: float = 0.05,
+    maximum: float = 10.0,
+    step: float = 0.1,
+) -> QDoubleSpinBox:
+    spin = QDoubleSpinBox()
+    spin.setRange(minimum, maximum)
+    spin.setDecimals(3)
+    spin.setSingleStep(step)
+    spin.setValue(float(value))
+    return spin
+
+
+def _angle_spin(value: float) -> QDoubleSpinBox:
+    spin = QDoubleSpinBox()
+    spin.setRange(0.1, 15.0)
+    spin.setDecimals(1)
+    spin.setSingleStep(0.5)
+    spin.setValue(float(value))
+    return spin
+
+
+def _integer_spin(minimum: int, maximum: int, value: int) -> QSpinBox:
+    spin = QSpinBox()
+    spin.setRange(minimum, maximum)
+    spin.setSingleStep(1)
+    spin.setValue(value)
+    return spin
+
+
+def _add_spin_row(layout: QGridLayout, row: int, label: str, widget: QWidget) -> int:
+    layout.addWidget(QLabel(label), row, 0)
+    layout.addWidget(widget, row, 1)
+    return row + 1
+
+
 def _optional_distance_spin() -> QDoubleSpinBox:
     spin = _distance_spin(0.0)
     spin.setSpecialValueText("自动")
@@ -734,16 +1246,74 @@ def _format4(value: float) -> str:
     return f"{value:.4f}"
 
 
-def _model_bounds(model: FaceModel) -> QRectF:
-    if not model.nodes:
+def _model_bounds(
+    model: FaceModel,
+    outline_segments: tuple[tuple[Point2D, Point2D], ...] = (),
+) -> QRectF:
+    points: list[Point2D] = [(node.x, node.y) for node in model.nodes]
+    for start, end in outline_segments:
+        points.append(start)
+        points.append(end)
+
+    if not points:
         return QRectF(0, 0, 1, 1)
-    xs = [node.x for node in model.nodes]
-    ys = [node.y for node in model.nodes]
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
     min_x = min(xs)
     min_y = min(ys)
     width = max(max(xs) - min_x, 1e-6)
     height = max(max(ys) - min_y, 1e-6)
     return QRectF(min_x, min_y, width, height)
+
+
+def _model_delta(before: FaceModel | None, after: FaceModel) -> _ModelDelta:
+    before_node_keys: set[tuple[float, float]] = set()
+    before_member_keys: set[tuple[tuple[float, float], tuple[float, float]]] = set()
+    if before is not None:
+        before_node_keys = {_node_key(node) for node in before.nodes}
+        before_member_keys = _member_geometry_keys(before)
+
+    node_ids = tuple(
+        node.id
+        for node in after.nodes
+        if _node_key(node) not in before_node_keys
+    )
+    member_ids = tuple(
+        member.id
+        for member in after.members
+        if _member_geometry_key(after, member) not in before_member_keys
+    )
+    return _ModelDelta(node_ids=node_ids, member_ids=member_ids)
+
+
+def _member_geometry_keys(model: FaceModel) -> set[tuple[tuple[float, float], tuple[float, float]]]:
+    keys: set[tuple[tuple[float, float], tuple[float, float]]] = set()
+    for member in model.members:
+        key = _member_geometry_key(model, member)
+        if key is not None:
+            keys.add(key)
+    return keys
+
+
+def _member_geometry_key(
+    model: FaceModel,
+    member: Member2D,
+) -> tuple[tuple[float, float], tuple[float, float]] | None:
+    nodes = {node.id: node for node in model.nodes}
+    start = nodes.get(member.start_node_id)
+    end = nodes.get(member.end_node_id)
+    if start is None or end is None:
+        return None
+    endpoints = sorted((_node_key(start), _node_key(end)))
+    return (endpoints[0], endpoints[1])
+
+
+def _node_key(node: Node2D) -> tuple[float, float]:
+    return (round(node.x, 4), round(node.y, 4))
+
+
+def _format_id_list(ids: tuple[str, ...]) -> str:
+    return "无" if not ids else ", ".join(ids)
 
 
 def _distance_squared_to_segment(

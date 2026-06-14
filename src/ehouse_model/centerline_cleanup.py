@@ -27,6 +27,7 @@ class CenterlineCleanupOptions:
     short_member_max_candidates_per_point: int = 2
     cluster_realign_radius: float = 800.0
     cluster_realign_max_search_candidates: int = 20
+    cluster_realign_orientation: str = "auto"
     min_length: float = 1e-6
 
     def __post_init__(self) -> None:
@@ -58,6 +59,8 @@ class CenterlineCleanupOptions:
             raise ValueError("cluster_realign_radius must be positive")
         if self.cluster_realign_max_search_candidates <= 0:
             raise ValueError("cluster_realign_max_search_candidates must be positive")
+        if self.cluster_realign_orientation not in {"auto", "horizontal", "vertical"}:
+            raise ValueError("cluster_realign_orientation must be auto, horizontal, or vertical")
         if self.min_length <= 0:
             raise ValueError("min_length must be positive")
 
@@ -247,9 +250,10 @@ def realign_centerline_cluster_near_points(
             max_width_to_length_ratio=0.35,
             max_pair_length=None,
         )
+        orientations = _cluster_realign_orientations(opts.cluster_realign_orientation)
         orientation_candidates = {
             orientation: [pair for pair in pair_candidates if _pair_orientation(pair) == orientation]
-            for orientation in ("H", "V")
+            for orientation in orientations
         }
         best_orientation: str | None = None
         best_pairs: tuple[_SegmentPairCandidate, ...] = ()
@@ -341,6 +345,14 @@ def realign_centerline_cluster_near_points(
         replaced_group_count=replaced_groups,
         warnings=tuple(warnings),
     )
+
+
+def _cluster_realign_orientations(value: str) -> tuple[str, ...]:
+    if value == "horizontal":
+        return ("H",)
+    if value == "vertical":
+        return ("V",)
+    return ("H", "V")
 
 
 def _project_segments(

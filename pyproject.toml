@@ -18,6 +18,8 @@ dependencies = [
 [project.scripts]
 ehouse-extract-face = "ehouse_model.face_extractor:main"
 ehouse-gui = "ehouse_model.gui.app:main"
+ehouse-preprocess-dxf = "ehouse_model.dxf_preprocessor:main"
+ehouse-preprocess-gui = "ehouse_model.gui.preprocess_app:main"
 
 [tool.pytest.ini_options]
 addopts = "-p no:cacheprovider"

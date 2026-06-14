@@ -157,12 +157,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--overlay", default="centerline_overlay.dxf", help="Output overlay DXF path.")
     parser.add_argument("--warnings", default="warnings.csv", help="Output warnings.csv path.")
     parser.add_argument("--max-pair-width", type=float, default=None)
+    parser.add_argument("--max-pair-width-to-length-ratio", type=float, default=0.35)
     parser.add_argument("--angle-tolerance", type=float, default=2.0)
     args = parser.parse_args(argv)
 
     options = FaceExtractionOptions(
         angle_tolerance_degrees=args.angle_tolerance,
         max_pair_width=args.max_pair_width,
+        max_pair_width_to_length_ratio=args.max_pair_width_to_length_ratio,
     )
     extract_face(
         args.dxf_path,
@@ -203,9 +205,10 @@ def _find_pair_candidates(
             if width < options.min_pair_width:
                 continue
 
-            max_width = options.max_pair_width
-            if max_width is None:
-                max_width = min_length * options.max_pair_width_to_length_ratio
+            ratio_width = min_length * options.max_pair_width_to_length_ratio
+            max_width = ratio_width
+            if options.max_pair_width is not None:
+                max_width = min(options.max_pair_width, ratio_width)
             if width > max_width:
                 continue
 

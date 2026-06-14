@@ -78,6 +78,7 @@ class BaseExtractionResult:
     global_model: GlobalModel
     origin: Point2D
     snap_count: int
+    outline_segments: tuple[tuple[Point2D, Point2D], ...] = ()
     origin_source: Point2D = (0.0, 0.0)
     terminal_stub_removed_count: int = 0
     local_patch_added_count: int = 0
@@ -197,6 +198,13 @@ def extract_base_face(
     normalized = normalize_base_coordinates(raw_model)
     model = normalized.face_model
     global_model = face_model_to_base_global_model(model)
+    outline_segments = tuple(
+        (
+            _normalize_point(segment.start, normalized.origin_source),
+            _normalize_point(segment.end, normalized.origin_source),
+        )
+        for segment in segments
+    )
 
     if face_model_path is not None:
         write_face_model_json(model, face_model_path)
@@ -214,6 +222,7 @@ def extract_base_face(
         global_model=global_model,
         origin=normalized.origin,
         snap_count=snap_count,
+        outline_segments=outline_segments,
         origin_source=normalized.origin_source,
         terminal_stub_removed_count=terminal_stub_removed_count,
         local_patch_added_count=local_patch_added_count,
@@ -402,9 +411,10 @@ def _find_local_pair_candidates(
             if not _width_matches_known(width, known_widths, width_tolerance, width_tolerance_ratio):
                 continue
 
-            max_width = options.max_pair_width
-            if max_width is None:
-                max_width = min_length * options.max_pair_width_to_length_ratio
+            ratio_width = min_length * options.max_pair_width_to_length_ratio
+            max_width = ratio_width
+            if options.max_pair_width is not None:
+                max_width = min(options.max_pair_width, ratio_width)
             if width > max_width:
                 continue
 

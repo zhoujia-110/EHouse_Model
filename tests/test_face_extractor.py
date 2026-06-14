@@ -94,11 +94,21 @@ def test_extract_face_uses_max_pair_width_override(tmp_path):
         face_model_path=tmp_path / "relaxed_face_model.json",
         overlay_path=tmp_path / "relaxed_overlay.dxf",
         warnings_csv_path=tmp_path / "relaxed_warnings.csv",
-        options=FaceExtractionOptions(max_pair_width=6.0),
+        options=FaceExtractionOptions(max_pair_width=6.0, max_pair_width_to_length_ratio=0.6),
     )
     assert len(relaxed_model.members) == 1
     assert relaxed_model.centerline_candidates[0].start == pytest.approx((0.0, 2.5))
     assert relaxed_model.centerline_candidates[0].end == pytest.approx((10.0, 2.5))
+
+    capped_model = extract_face(
+        dxf_path,
+        face_model_path=tmp_path / "capped_face_model.json",
+        overlay_path=tmp_path / "capped_overlay.dxf",
+        warnings_csv_path=tmp_path / "capped_warnings.csv",
+        options=FaceExtractionOptions(max_pair_width=4.0, max_pair_width_to_length_ratio=1.0),
+    )
+    assert capped_model.members == ()
+    assert capped_model.warnings[0].code == "no_centerline_candidates"
 
 
 def test_centerline_pairing_reuses_long_outline_on_disjoint_intervals():
