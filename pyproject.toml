@@ -17,7 +17,9 @@ dependencies = [
 
 [project.scripts]
 ehouse-extract-face = "ehouse_model.face_extractor:main"
+ehouse-extract-roof = "ehouse_model.roof_processing:main"
 ehouse-gui = "ehouse_model.gui.app:main"
+ehouse-project-wizard = "ehouse_model.gui.project_wizard_app:main"
 ehouse-preprocess-dxf = "ehouse_model.dxf_preprocessor:main"
 ehouse-preprocess-gui = "ehouse_model.gui.preprocess_app:main"
 

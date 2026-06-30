@@ -26,3 +26,28 @@ def test_export_staad_geometry_writes_minimal_std(tmp_path):
         "1 1 2;\n"
         "FINISH\n"
     )
+
+
+def test_export_staad_geometry_preserves_numeric_global_ids(tmp_path):
+    output = tmp_path / "geometry.std"
+    model = GlobalModel(
+        project_name="Demo",
+        nodes=(
+            Node3D(id="10001", x=0, y=0, z=0),
+            Node3D(id="20001", x=0, y=3.5, z=0),
+        ),
+        members=(Member3D(id="20001", start_node_id="10001", end_node_id="20001"),),
+    )
+
+    export_staad_geometry(model, output)
+
+    assert output.read_text(encoding="utf-8") == (
+        "STAAD SPACE\n"
+        "UNIT METER KN\n"
+        "JOINT COORDINATES\n"
+        "10001 0 0 0;\n"
+        "20001 0 3.5 0;\n"
+        "MEMBER INCIDENCES\n"
+        "20001 10001 20001;\n"
+        "FINISH\n"
+    )

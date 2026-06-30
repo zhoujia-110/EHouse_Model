@@ -12,7 +12,8 @@ def export_staad_geometry(model: GlobalModel, path: str | Path) -> None:
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    node_numbers = {node.id: index for index, node in enumerate(model.nodes, start=1)}
+    node_numbers = _staad_number_map([node.id for node in model.nodes])
+    member_numbers = _staad_number_map([member.id for member in model.members])
     lines = ["STAAD SPACE", "UNIT METER KN", "JOINT COORDINATES"]
 
     for node in model.nodes:
@@ -22,7 +23,8 @@ def export_staad_geometry(model: GlobalModel, path: str | Path) -> None:
         )
 
     lines.append("MEMBER INCIDENCES")
-    for member_number, member in enumerate(model.members, start=1):
+    for member in model.members:
+        member_number = member_numbers[member.id]
         lines.append(
             f"{member_number} {node_numbers[member.start_node_id]} {node_numbers[member.end_node_id]};"
         )
@@ -36,3 +38,20 @@ def _format_float(value: float) -> str:
     if text in ("", "-0"):
         return "0"
     return text
+
+
+def _staad_number_map(ids: list[str]) -> dict[str, int]:
+    numeric_ids = [_positive_int_or_none(value) for value in ids]
+    if all(value is not None for value in numeric_ids) and len(set(numeric_ids)) == len(numeric_ids):
+        return {raw_id: int(number) for raw_id, number in zip(ids, numeric_ids)}
+    return {raw_id: index for index, raw_id in enumerate(ids, start=1)}
+
+
+def _positive_int_or_none(value: str) -> int | None:
+    text = str(value).strip()
+    if not text.isdigit():
+        return None
+    number = int(text)
+    if number <= 0:
+        return None
+    return number

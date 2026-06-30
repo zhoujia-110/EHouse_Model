@@ -124,27 +124,83 @@ class ProjectFaceSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class ProjectPartSpec:
+    id: str
+    part_type: str
+    status: str = "not_started"
+    dxf_path: str | None = None
+    clean_dxf_path: str | None = None
+    face_model_path: str | None = None
+    part_geometry_path: str | None = None
+    modified_std_path: str | None = None
+    active_source: str = "generated"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "id", _non_empty_text(self.id, "id"))
+        object.__setattr__(self, "part_type", _canonical_part_type(self.part_type))
+        object.__setattr__(self, "status", _non_empty_text(self.status, "status"))
+        object.__setattr__(self, "active_source", _non_empty_text(self.active_source, "active_source"))
+        for field_name in (
+            "dxf_path",
+            "clean_dxf_path",
+            "face_model_path",
+            "part_geometry_path",
+            "modified_std_path",
+        ):
+            value = getattr(self, field_name)
+            if value is not None:
+                object.__setattr__(self, field_name, str(value))
+
+    def to_dict(self) -> dict[str, object]:
+        data: dict[str, object] = {
+            "id": self.id,
+            "part_type": self.part_type,
+            "status": self.status,
+            "active_source": self.active_source,
+        }
+        if self.dxf_path is not None:
+            data["dxf_path"] = self.dxf_path
+        if self.clean_dxf_path is not None:
+            data["clean_dxf_path"] = self.clean_dxf_path
+        if self.face_model_path is not None:
+            data["face_model_path"] = self.face_model_path
+        if self.part_geometry_path is not None:
+            data["part_geometry_path"] = self.part_geometry_path
+        if self.modified_std_path is not None:
+            data["modified_std_path"] = self.modified_std_path
+        return data
+
+
+@dataclass(frozen=True, slots=True)
 class EHouseProject:
     name: str
     dimensions: ProjectDimensions
-    faces: tuple[ProjectFaceSpec, ...]
+    faces: tuple[ProjectFaceSpec, ...] = ()
+    parts: tuple[ProjectPartSpec, ...] = ()
     path: Path | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", _non_empty_text(self.name, "name"))
-        if not self.faces:
-            raise ValueError("project must contain at least one face")
         face_ids = [face.id for face in self.faces]
         if len(face_ids) != len(set(face_ids)):
             raise ValueError("project face ids must be unique")
+        part_ids = [part.id for part in self.parts]
+        if len(part_ids) != len(set(part_ids)):
+            raise ValueError("project part ids must be unique")
+        if not self.faces and not self.parts:
+            raise ValueError("project must contain at least one face or part")
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        data: dict[str, object] = {
             "schema_version": 1,
             "name": self.name,
             "dimensions": self.dimensions.to_dict(),
-            "faces": [face.to_dict() for face in self.faces],
         }
+        if self.faces:
+            data["faces"] = [face.to_dict() for face in self.faces]
+        if self.parts:
+            data["parts"] = [part.to_dict() for part in self.parts]
+        return data
 
 
 def load_project_json(path: str | Path = "project.json") -> EHouseProject:
@@ -154,11 +210,17 @@ def load_project_json(path: str | Path = "project.json") -> EHouseProject:
         raise ValueError("project.json must contain a mapping")
 
     dimensions = _parse_dimensions(raw.get("dimensions"))
-    faces = tuple(_parse_face(value, index) for index, value in enumerate(_require_list(raw, "faces")))
+    raw_faces = raw.get("faces", [])
+    raw_parts = raw.get("parts", [])
+    if not raw_faces and not raw_parts:
+        raise ValueError("project.json must define faces or parts")
+    faces = tuple(_parse_face(value, index) for index, value in enumerate(_optional_list(raw_faces, "faces")))
+    parts = tuple(_parse_part(value, index) for index, value in enumerate(_optional_list(raw_parts, "parts")))
     return EHouseProject(
         name=str(raw.get("name", "E-House Project")),
         dimensions=dimensions,
         faces=faces,
+        parts=parts,
         path=project_path,
     )
 
@@ -198,6 +260,23 @@ def _parse_face(raw: dict[str, Any], index: int) -> ProjectFaceSpec:
         raise ValueError(f"invalid faces[{index}]: {exc}") from exc
 
 
+def _parse_part(raw: dict[str, Any], index: int) -> ProjectPartSpec:
+    try:
+        return ProjectPartSpec(
+            id=raw.get("id"),
+            part_type=raw.get("part_type"),
+            status=raw.get("status", "not_started"),
+            dxf_path=raw.get("dxf_path"),
+            clean_dxf_path=raw.get("clean_dxf_path"),
+            face_model_path=raw.get("face_model_path"),
+            part_geometry_path=raw.get("part_geometry_path"),
+            modified_std_path=raw.get("modified_std_path"),
+            active_source=raw.get("active_source", "generated"),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid parts[{index}]: {exc}") from exc
+
+
 def _default_plane_mapping(
     plane_type: str,
     dimensions: ProjectDimensions,
@@ -222,6 +301,37 @@ def _canonical_plane_type(value: object) -> str:
     text = _non_empty_text(value, "plane_type")
     key = text.strip().lower().replace("-", "_").replace(" ", "_")
     return _PLANE_ALIASES.get(key, _PLANE_ALIASES.get(text, key))
+
+
+def _canonical_part_type(value: object) -> str:
+    key = _non_empty_text(value, "part_type").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "base": "base",
+        "bottom": "base",
+        "底座": "base",
+        "roof": "roof",
+        "top": "roof",
+        "屋盖": "roof",
+        "side_wall": "side_wall",
+        "wall": "side_wall",
+        "left_wall": "side_wall",
+        "right_wall": "side_wall",
+        "front_wall": "side_wall",
+        "back_wall": "side_wall",
+        "侧墙": "side_wall",
+        "end_wall": "side_wall",
+    }
+    return aliases.get(key, key)
+
+
+def _optional_list(value: object, key: str) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"project.json must define {key} as a list")
+    if not all(isinstance(item, dict) for item in value):
+        raise ValueError(f"project.json {key} entries must be mappings")
+    return value
 
 
 def _require_list(raw: dict[str, object], key: str) -> list[dict[str, Any]]:
